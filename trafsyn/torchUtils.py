@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import time, gc
+import subprocess
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,8 +12,29 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from trafsyn.utils import Qdata, Model
 from trafsyn.plot import ComparePlots, pcolormesh
 from typing import Any, Tuple, Optional, List
+from tqdm import tqdm
 
 ######################## DATA UTILS ########################
+
+
+
+def get_mps_info():
+    # Run system_profiler command to get display information
+    gpu_info = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
+    
+    # Extract lines that mention the GPU name and core count
+    lines = gpu_info.stdout.splitlines()
+    gpu_name = ""
+    core_count = ""
+    
+    for line in lines:
+        if "Chipset Model" in line:
+            gpu_name = line.split(": ")[1]  # Extract the GPU name
+        elif "Total Number of Cores" in line:
+            core_count = line.split(": ")[1]  # Extract the number of cores
+    
+    # Format  the result
+    return f"{gpu_name} {core_count} cores"
 
 # Custom dataset class that wraps NumPy arrays
 class QDataset(Dataset):
@@ -457,7 +479,10 @@ def TBPTT(
     else:
         if torch.cuda.is_available():
             device = torch.device('cuda')
-            print("using GPU :",torch.cuda.get_device_name(0))
+            print("using GPU :", torch.cuda.get_device_name(0))
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+            print(f"using GPU : {get_mps_info()}")
         else: 
             device = torch.device('cpu')
             print('using cpu device')
@@ -499,43 +524,47 @@ def TBPTT(
     decays = [decay**(timesteps-2-j) for j in range(timesteps-1)]
     print(f"Train model with TBPTT: Nts {timesteps} | loss {lossName} | b_size {str(batch_size)} | k1 {k1} | decay {decay} {'| clip ' + str(clip) if clip else ''}")
     # Start training
-    for epoch in range(epochs):
-        for i, (Q_t, Q_nxt) in enumerate(dataloader):
-        # Forward pass
-            Q_t = Q_t.to(device)
-            Q_nxt = Q_nxt.to(device)
-            loss = 0
+    with tqdm(range(epochs), desc='Epoch') as pbar:
+        for epoch in pbar:
+            for i, (Q_t, Q_nxt) in enumerate(dataloader):
+            # Forward pass
+                Q_t = Q_t.to(device)
+                Q_nxt = Q_nxt.to(device)
+                loss = 0
 
-            for j in range(timesteps-1):
-                Q_t = model.forward(Q_t)
-                loss +=  loss_fx(Q_t,Q_nxt[:,j:j+1,:]) * decays[j]
-                #backward every k1 timesteps an release CUDA memory for longer inference
-                if (timesteps - 2 - j )%k1 == 0:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    if clip: nn.utils.clip_grad_norm_(model.parameters(), clip)
-                    optimizer.step()
-                    Q_t.detach_()
-                    loss.detach_()
+                for j in range(timesteps-1):
+                    Q_t = model.forward(Q_t)
+                    loss +=  loss_fx(Q_t,Q_nxt[:,j:j+1,:]) * decays[j]
+                    #backward every k1 timesteps an release CUDA memory for longer inference
+                    if (timesteps - 2 - j )%k1 == 0:
+                        optimizer.zero_grad()
+                        loss.backward()
+                        if clip: nn.utils.clip_grad_norm_(model.parameters(), clip)
+                        optimizer.step()
+                        Q_t.detach_()
+                        loss.detach_()
 
-        scheduler.step(loss)
-        history.append(
-            {   
-                'epoch': epoch,
-                'loss': loss.item(),
-                'LR': optimizer.param_groups[0]['lr'],
-            }
-        )
-        if optimizer.param_groups[0]['lr'] <= min_lr:
-            print ("Epoch[{}/{}], Step [{}/{}], {} Loss: {:.6f},LR: {:.3e}" 
-                    .format(epoch+1, epochs, i+1, len(dataloader),lossName, loss, optimizer.param_groups[0]['lr']))
-            print("Stopping ...")
-            break
+            scheduler.step(loss)
+            history.append(
+                {   
+                    'epoch': epoch,
+                    'loss': loss.item(),
+                    'LR': optimizer.param_groups[0]['lr'],
+                }
+            )
+
+            pbar.set_description(f"Step {i+1}/{len(dataloader)} {lossName} Loss: {loss.item():.6f} | LR: {optimizer.param_groups[0]['lr']:.3e}")
+            
+            if optimizer.param_groups[0]['lr'] <= min_lr:
+                print ("Epoch[{}/{}], Step [{}/{}], {} Loss: {:.6f},LR: {:.3e}" 
+                        .format(epoch+1, epochs, i+1, len(dataloader),lossName, loss, optimizer.param_groups[0]['lr']))
+                print("Stopping ...")
+                break
+            
+            # if epoch % int(epochs/10+1) == 0:
+            #     print ("Epoch[{}/{}], Step [{}/{}], {} Loss: {:.6f},LR: {:.3e}" 
+            #             .format(epoch+1, epochs, i+1, len(dataloader),lossName, loss, optimizer.param_groups[0]['lr']))
         
-        if epoch % int(epochs/10+1) == 0:
-            print ("Epoch[{}/{}], Step [{}/{}], {} Loss: {:.6f},LR: {:.3e}" 
-                    .format(epoch+1, epochs, i+1, len(dataloader),lossName, loss, optimizer.param_groups[0]['lr']))
-    
     elapsed = time.time() - tbeg
     print(f"Performed {epoch+1} epochs in {elapsed :.2}s: {(epoch+1)/elapsed:.3} epochs/s")
 
